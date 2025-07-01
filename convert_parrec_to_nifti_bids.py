@@ -113,7 +113,7 @@ def extract_scan_info_from_filename(filename):
         }
     return {}
 
-def bids_entities(scan_info):
+def bids_entities(scan_info, t1w_count=None):
     # Use subject ID from the parent folder name
     sub = scan_info.get('subject_id', 'unknown')
     
@@ -129,6 +129,13 @@ def bids_entities(scan_info):
     if 't1w' in protocol or 't1' in protocol:
         suffix = 'T1w'
         modality = 'anat'
+        # Add run number for T1w files to distinguish multiple acquisitions
+        if t1w_count is not None:
+            if acq not in t1w_count:
+                t1w_count[acq] = 1
+            else:
+                t1w_count[acq] += 1
+            run = str(t1w_count[acq])
     elif 't2w' in protocol or 't2' in protocol:
         suffix = 'T2w'
         modality = 'anat'
@@ -155,8 +162,13 @@ def bids_entities(scan_info):
         suffix = 'unknown'
         modality = 'unknown'
     
-    # Build BIDS filename - no session information, no acquisition labels
+    # Build BIDS filename - no session information
     parts = [f"sub-{sub}"]
+    
+    # Add acquisition label for T1w files to distinguish different acquisitions
+    if modality == 'anat' and 't1' in protocol:
+        if acq and acq not in ['', 'none']:
+            parts.append(f"acq-{acq}")
     
     if modality == 'func' and 'task' in locals():
         parts.append(f"task-{task}")
@@ -206,6 +218,9 @@ def process_subject_directory(subject_dir):
     
     print(f"\nProcessing subject {subject_id}: Found {len(par_files)} PAR files")
     
+    # Track T1w files to assign run numbers
+    t1w_count = {}
+    
     # Process each PAR file
     for par_file in par_files:
         print(f"\nProcessing: {par_file.name}")
@@ -220,7 +235,7 @@ def process_subject_directory(subject_dir):
             str(par_file.with_suffix('.V41'))
         ]
         
-        bids_base, modality = bids_entities(scan_info)
+        bids_base, modality = bids_entities(scan_info, t1w_count)
         par_metadata = parse_par_file(par_file)
         xml_file = par_file.with_suffix('.XML')
         xml_metadata = parse_xml_file(xml_file) if xml_file.exists() else {}
