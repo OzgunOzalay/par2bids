@@ -5,6 +5,24 @@ BIDS-compatible conversion of Philips PAR/REC files to NIfTI format.
 This script processes all PAR/REC files and converts them to BIDS-compliant
 NIfTI files with comprehensive JSON sidecar files containing metadata from
 PAR and XML files.
+
+Directory structure:
+Data/
+├── [SubjectID]/
+│   ├── XMLPARREC/          # Input directory
+│   │   ├── *.PAR           # Parameter files
+│   │   ├── *.REC           # Raw image data
+│   │   ├── *.XML           # Extended metadata
+│   │   └── *.V41           # Additional parameters
+│   └── NIfTI_BIDS/         # Output directory
+│       ├── sub-*_ses-*_task-*_bold.nii.gz
+│       ├── sub-*_ses-*_task-*_bold.json
+│       └── ...
+
+Usage:
+    python convert_parrec_to_nifti_bids.py                    # Convert all subjects
+    python convert_parrec_to_nifti_bids.py VA003             # Convert specific subject
+    python convert_parrec_to_nifti_bids.py VA003 VA004       # Convert multiple subjects
 """
 
 import os
@@ -12,6 +30,7 @@ import json
 import subprocess
 import re
 import xml.etree.ElementTree as ET
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -158,17 +177,33 @@ def convert_parrec_to_nifti(par_file, output_dir):
         print(f"Error converting {par_file}: {e}\nstderr: {e.stderr}")
         return None
 
-def main():
-    input_dir = Path("XMLPARREC")
-    output_dir = Path("NIfTI_BIDS")
-    output_dir.mkdir(exist_ok=True)
-    par_files = list(input_dir.glob("*.PAR"))
-    if not par_files:
-        print("No PAR files found in XMLPARREC directory")
+def process_subject_directory(subject_dir):
+    """Process a single subject directory."""
+    subject_id = subject_dir.name
+    xmlparrec_dir = subject_dir / "XMLPARREC"
+    nifti_bids_dir = subject_dir / "NIfTI_BIDS"
+    
+    if not xmlparrec_dir.exists():
+        print(f"No XMLPARREC directory found in {subject_dir}")
         return
-    print(f"Found {len(par_files)} PAR files to convert")
+    
+    # Create output directory
+    nifti_bids_dir.mkdir(exist_ok=True)
+    
+    # Find all PAR files
+    par_files = list(xmlparrec_dir.glob("*.PAR"))
+    
+    if not par_files:
+        print(f"No PAR files found in {xmlparrec_dir}")
+        return
+    
+    print(f"\nProcessing subject {subject_id}: Found {len(par_files)} PAR files")
+    
+    # Process each PAR file
     for par_file in par_files:
         print(f"\nProcessing: {par_file.name}")
+        
+        # Extract scan information
         scan_info = extract_scan_info_from_filename(par_file.name)
         scan_info['source_files'] = [
             str(par_file),
@@ -176,11 +211,13 @@ def main():
             str(par_file.with_suffix('.XML')),
             str(par_file.with_suffix('.V41'))
         ]
+        
         bids_base, modality = bids_entities(scan_info)
         par_metadata = parse_par_file(par_file)
         xml_file = par_file.with_suffix('.XML')
         xml_metadata = parse_xml_file(xml_file) if xml_file.exists() else {}
-        nifti_file = convert_parrec_to_nifti(par_file, output_dir)
+        nifti_file = convert_parrec_to_nifti(par_file, nifti_bids_dir)
+        
         actual_nifti_file = None
         if nifti_file and nifti_file.exists():
             actual_nifti_file = nifti_file
@@ -188,11 +225,13 @@ def main():
             gz_file = Path(str(nifti_file) + '.gz')
             if gz_file.exists():
                 actual_nifti_file = gz_file
+        
         if actual_nifti_file and actual_nifti_file.exists():
             # Rename to BIDS
             # Always use .nii.gz for compressed NIfTI
-            bids_nifti = output_dir / f"{bids_base}.nii.gz"
+            bids_nifti = nifti_bids_dir / f"{bids_base}.nii.gz"
             actual_nifti_file.rename(bids_nifti)
+            
             # JSON sidecar
             json_data = {
                 "ConversionSoftware": "convert_parrec_to_nifti_bids.py",
@@ -201,6 +240,7 @@ def main():
                 "SourceFormat": "Philips PAR/REC",
                 "SourceFiles": scan_info['source_files'],
                 "BIDSModality": modality,
+                "SubjectID": subject_id,
                 **par_metadata,
                 "XMLMetadata": xml_metadata
             }
@@ -210,7 +250,90 @@ def main():
             print(f"BIDS conversion complete: {bids_nifti.name} + {json_file.name}")
         else:
             print(f"Failed to convert {par_file.name}")
-    print(f"\nBIDS conversion complete! Files saved in: {output_dir}")
+
+def main():
+    """Main conversion function."""
+    parser = argparse.ArgumentParser(
+        description="Convert Philips PAR/REC files to BIDS-compliant NIfTI format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s                    # Convert all subjects
+  %(prog)s VA003             # Convert specific subject
+  %(prog)s VA003 VA004       # Convert multiple subjects
+        """
+    )
+    parser.add_argument(
+        'subjects', 
+        nargs='*', 
+        help='Specific subject IDs to convert (e.g., VA003 VA004). If none provided, converts all subjects.'
+    )
+    parser.add_argument(
+        '--data-dir', 
+        default='Data', 
+        help='Base data directory (default: Data)'
+    )
+    parser.add_argument(
+        '--verbose', '-v', 
+        action='store_true', 
+        help='Verbose output'
+    )
+    
+    args = parser.parse_args()
+    
+    data_dir = Path(args.data_dir)
+    
+    if not data_dir.exists():
+        print(f"Data directory '{data_dir}' not found. Please ensure your data is organized as:")
+        print(f"{data_dir}/")
+        print("├── [SubjectID]/")
+        print("│   ├── XMLPARREC/")
+        print("│   │   ├── *.PAR")
+        print("│   │   ├── *.REC")
+        print("│   │   ├── *.XML")
+        print("│   │   └── *.V41")
+        print("│   └── NIfTI_BIDS/ (will be created)")
+        return
+    
+    # Find all subject directories
+    all_subject_dirs = [d for d in data_dir.iterdir() if d.is_dir()]
+    
+    if not all_subject_dirs:
+        print(f"No subject directories found in {data_dir}/")
+        return
+    
+    # Filter subjects if specific ones were requested
+    if args.subjects:
+        requested_subjects = set(args.subjects)
+        subject_dirs = [d for d in all_subject_dirs if d.name in requested_subjects]
+        
+        # Check for missing subjects
+        found_subjects = {d.name for d in subject_dirs}
+        missing_subjects = requested_subjects - found_subjects
+        if missing_subjects:
+            print(f"Warning: The following requested subjects were not found: {missing_subjects}")
+            print(f"Available subjects: {[d.name for d in all_subject_dirs]}")
+        
+        if not subject_dirs:
+            print("No requested subjects found. Available subjects:")
+            for d in all_subject_dirs:
+                print(f"  - {d.name}")
+            return
+    else:
+        subject_dirs = all_subject_dirs
+    
+    print(f"Found {len(subject_dirs)} subject(s) to process:")
+    for subject_dir in subject_dirs:
+        print(f"  - {subject_dir.name}")
+    
+    # Process each subject
+    for subject_dir in subject_dirs:
+        print(f"\n{'='*50}")
+        print(f"Processing subject: {subject_dir.name}")
+        print(f"{'='*50}")
+        process_subject_directory(subject_dir)
+    
+    print(f"\nBIDS conversion complete for {len(subject_dirs)} subject(s)!")
 
 if __name__ == "__main__":
     main() 
