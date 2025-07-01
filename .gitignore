@@ -43,7 +43,7 @@ Thumbs.db
 
 # Project specific
 NIfTI_BIDS/
-XMLPARREC/
+Data/
 *.PAR
 *.REC
 *.XML
