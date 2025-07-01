@@ -114,11 +114,18 @@ def extract_scan_info_from_filename(filename):
     return {}
 
 def bids_entities(scan_info):
-    sub = re.sub(r'[^a-zA-Z0-9]', '', scan_info.get('patient_id', 'unknown'))
-    ses = scan_info.get('series_number', '01')
+    # Use subject ID from the parent folder name
+    sub = scan_info.get('subject_id', 'unknown')
+    
+    # Clean up acquisition name - remove "wip", "vip" and redundant information
     acq = scan_info.get('protocol_name', 'acq')
     acq = re.sub(r'[^a-zA-Z0-9]', '', acq.lower())
+    acq = acq.replace('wip', '').replace('vip', '')  # Remove wip/vip
+    acq = acq.replace('_', '').strip()  # Remove underscores and whitespace
+    
     protocol = scan_info.get('protocol_name', '').lower()
+    
+    # Determine modality and suffix based on protocol
     if 't1w' in protocol or 't1' in protocol:
         suffix = 'T1w'
         modality = 'anat'
@@ -147,10 +154,10 @@ def bids_entities(scan_info):
     else:
         suffix = 'unknown'
         modality = 'unknown'
+    
+    # Build BIDS filename - no session information, no acquisition labels
     parts = [f"sub-{sub}"]
-    if ses != '01':
-        parts.append(f"ses-{ses}")
-    parts.append(f"acq-{acq}")
+    
     if modality == 'func' and 'task' in locals():
         parts.append(f"task-{task}")
     if 'run' in locals():
@@ -205,6 +212,7 @@ def process_subject_directory(subject_dir):
         
         # Extract scan information
         scan_info = extract_scan_info_from_filename(par_file.name)
+        scan_info['subject_id'] = subject_id  # Add subject ID from parent folder
         scan_info['source_files'] = [
             str(par_file),
             str(par_file.with_suffix('.REC')),
