@@ -34,46 +34,7 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-def parse_par_file(par_file_path):
-    metadata = {}
-    with open(par_file_path, 'r') as f:
-        content = f.read()
-    lines = content.split('\n')
-    for line in lines:
-        if ':' in line and line.strip().startswith('.'):
-            parts = line.split(':', 1)
-            if len(parts) == 2:
-                key = parts[0].strip().replace('.', '').strip()
-                value = parts[1].strip()
-                metadata[key] = value
-    scan_params = {}
-    for line in lines:
-        if 'Repetition time [ms]' in line:
-            scan_params['RepetitionTime'] = float(line.split(':')[1].strip())
-        elif 'Echo time [ms]' in line:
-            scan_params['EchoTime'] = float(line.split(':')[1].strip())
-        elif 'FOV (ap,fh,rl) [mm]' in line:
-            fov_str = line.split(':')[1].strip()
-            fov_values = [float(x) for x in fov_str.split()]
-            scan_params['FieldOfView'] = fov_values
-        elif 'Scan resolution  (x, y)' in line:
-            res_str = line.split(':')[1].strip()
-            res_values = [int(x) for x in res_str.split()]
-            scan_params['ScanResolution'] = res_values
-        elif 'Technique' in line:
-            scan_params['Technique'] = line.split(':')[1].strip()
-        elif 'Patient position' in line:
-            scan_params['PatientPosition'] = line.split(':')[1].strip()
-        elif 'Angulation midslice(ap,fh,rl)[degr]' in line:
-            ang_str = line.split(':')[1].strip()
-            ang_values = [float(x) for x in ang_str.split()]
-            scan_params['Angulation'] = ang_values
-        elif 'Off Centre midslice(ap,fh,rl) [mm]' in line:
-            off_str = line.split(':')[1].strip()
-            off_values = [float(x) for x in off_str.split()]
-            scan_params['OffCentre'] = off_values
-    metadata['ScanParameters'] = scan_params
-    return metadata
+
 
 def parse_xml_file(xml_file_path):
     metadata = {}
@@ -236,7 +197,7 @@ def process_subject_directory(subject_dir):
         ]
         
         bids_base, modality = bids_entities(scan_info, t1w_count)
-        par_metadata = parse_par_file(par_file)
+        par_metadata = extract_par_metadata(par_file)
         xml_file = par_file.with_suffix('.XML')
         xml_metadata = parse_xml_file(xml_file) if xml_file.exists() else {}
         nifti_file = convert_parrec_to_nifti(par_file, nifti_bids_dir)
@@ -267,12 +228,66 @@ def process_subject_directory(subject_dir):
                 **par_metadata,
                 "XMLMetadata": xml_metadata
             }
+            
+            # Add BIDS-specific fields for fMRI runs
+            if modality == 'func' and 'SliceTiming' in par_metadata:
+                json_data.update({
+                    "SliceEncodingDirection": "k",
+                    "PhaseEncodingDirection": "j-",
+                    "EffectiveEchoSpacing": 0.00051,  # Default for EPI, can be calculated from PAR if available
+                    "EchoTrainLength": 1
+                })
+            
             json_file = bids_nifti.with_suffix('.json')
             with open(json_file, 'w') as f:
                 json.dump(json_data, f, indent=2)
             print(f"BIDS conversion complete: {bids_nifti.name} + {json_file.name}")
         else:
             print(f"Failed to convert {par_file.name}")
+
+def extract_par_metadata(par_file):
+    """Extract metadata from PAR file header"""
+    metadata = {}
+    
+    with open(par_file, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    
+    # Extract basic parameters
+    tr_match = re.search(r'Repetition time \[ms\]\s*:\s*([\d.]+)', content)
+    if tr_match:
+        metadata['RepetitionTime'] = float(tr_match.group(1)) / 1000.0  # Convert to seconds
+    
+    te_match = re.search(r'Echo time \[ms\]\s*:\s*([\d.]+)', content)
+    if te_match:
+        metadata['EchoTime'] = float(te_match.group(1)) / 1000.0  # Convert to seconds
+    
+    slices_match = re.search(r'Max\. number of slices/locations\s*:\s*(\d+)', content)
+    if slices_match:
+        metadata['NumberOfSlices'] = int(slices_match.group(1))
+    
+    dynamics_match = re.search(r'Max\. number of dynamics\s*:\s*(\d+)', content)
+    if dynamics_match:
+        metadata['NumberOfDynamics'] = int(dynamics_match.group(1))
+    
+    fov_match = re.search(r'FOV \(ap,fh,rl\) \[mm\]\s*:\s*([\d.]+)\s+([\d.]+)\s+([\d.]+)', content)
+    if fov_match:
+        metadata['FieldOfView'] = [float(fov_match.group(1)), float(fov_match.group(2)), float(fov_match.group(3))]
+    
+    resolution_match = re.search(r'Scan resolution\s*\(x, y\)\s*:\s*(\d+)\s+(\d+)', content)
+    if resolution_match:
+        metadata['ScanResolution'] = [int(resolution_match.group(1)), int(resolution_match.group(2))]
+    
+    # Extract slice timing for fMRI runs
+    if metadata.get('NumberOfSlices') and metadata.get('RepetitionTime'):
+        # Calculate slice timing for EPI sequences
+        # For EPI, slice timing = (slice_number - 1) * (TR / number_of_slices)
+        slice_timing = []
+        for i in range(1, metadata['NumberOfSlices'] + 1):
+            timing = (i - 1) * (metadata['RepetitionTime'] / metadata['NumberOfSlices'])
+            slice_timing.append(timing)
+        metadata['SliceTiming'] = slice_timing
+    
+    return metadata
 
 def main():
     """Main conversion function."""
