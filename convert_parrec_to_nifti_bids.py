@@ -31,8 +31,10 @@ import subprocess
 import re
 import xml.etree.ElementTree as ET
 import argparse
+import shutil
 from pathlib import Path
 from datetime import datetime
+import nibabel as nib
 
 
 
@@ -186,6 +188,11 @@ def process_subject_directory(subject_dir):
     for par_file in par_files:
         print(f"\nProcessing: {par_file.name}")
         
+        # Skip survey/coil files that cause conversion errors
+        if 'survey' in par_file.name.lower() or 'coil' in par_file.name.lower():
+            print(f"Skipping survey/coil file: {par_file.name}")
+            continue
+        
         # Extract scan information
         scan_info = extract_scan_info_from_filename(par_file.name)
         scan_info['subject_id'] = subject_id  # Add subject ID from parent folder
@@ -200,7 +207,15 @@ def process_subject_directory(subject_dir):
         par_metadata = extract_par_metadata(par_file)
         xml_file = par_file.with_suffix('.XML')
         xml_metadata = parse_xml_file(xml_file) if xml_file.exists() else {}
-        nifti_file = convert_parrec_to_nifti(par_file, nifti_bids_dir)
+        
+        # Special handling for fieldmaps
+        if modality == 'fmap':
+            # Extract magnitude data if available
+            magnitude_file = extract_fieldmap_data(par_file, nifti_bids_dir, subject_id)
+            # Convert the full fieldmap (will contain phase difference)
+            nifti_file = convert_parrec_to_nifti(par_file, nifti_bids_dir)
+        else:
+            nifti_file = convert_parrec_to_nifti(par_file, nifti_bids_dir)
         
         actual_nifti_file = None
         if nifti_file and nifti_file.exists():
@@ -236,6 +251,13 @@ def process_subject_directory(subject_dir):
                     "PhaseEncodingDirection": "j-",
                     "EffectiveEchoSpacing": 0.00051,  # Default for EPI, can be calculated from PAR if available
                     "EchoTrainLength": 1
+                })
+            
+            # Add BIDS-specific fields for fieldmaps
+            if modality == 'fmap':
+                json_data.update({
+                    "Units": "Hz",
+                    "IntendedFor": []  # Will be populated by fMRIPrep
                 })
             
             json_file = bids_nifti.with_suffix('.json')
@@ -288,6 +310,102 @@ def extract_par_metadata(par_file):
         metadata['SliceTiming'] = slice_timing
     
     return metadata
+
+def extract_fieldmap_data(par_file, output_dir, subject_id):
+    """Extract magnitude and phase difference data from fieldmap PAR file using nibabel."""
+    par_path = Path(par_file)
+    base_name = par_path.stem
+    
+    # Read PAR file to understand structure
+    with open(par_file, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+    
+    # Find the image information section
+    lines = content.split('\n')
+    image_lines = []
+    in_image_section = False
+    
+    for line in lines:
+        if '# === IMAGE INFORMATION ==========================================================' in line:
+            in_image_section = True
+            continue
+        elif '# === END OF DATA DESCRIPTION FILE' in line:
+            break
+        elif in_image_section and line.strip() and not line.startswith('#'):
+            # Skip header line
+            if 'sl ec  dyn ph ty' not in line:
+                image_lines.append(line.strip())
+    
+    # Parse image lines to separate magnitude and phase data
+    magnitude_indices = []
+    phase_indices = []
+    
+    for i, line in enumerate(image_lines):
+        parts = line.split()
+        if len(parts) >= 5:
+            image_type = int(parts[4])  # 5th column is image_type_mr
+            if image_type == 0:  # Magnitude (Philips uses 0 for magnitude)
+                magnitude_indices.append(i)
+            elif image_type == 18:  # Phase difference
+                phase_indices.append(i)
+    
+    print(f"Found {len(magnitude_indices)} magnitude images and {len(phase_indices)} phase difference images")
+    
+    # Convert full PAR/REC to NIfTI
+    cmd = [
+        'parrec2nii',
+        '--overwrite',
+        '--output-dir', str(output_dir),
+        '--compressed',
+        '--store-header',
+        str(par_file)
+    ]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        full_nii = output_dir / f"{base_name}.nii.gz"
+        bids_magnitude = output_dir / f"sub-{subject_id}_magnitude1.nii.gz"
+        if full_nii.exists() and len(magnitude_indices) > 0:
+            # Use nibabel to extract the first N volumes (magnitude images)
+            img = nib.load(str(full_nii))
+            data = img.get_fdata()
+            # If 4D, select first N volumes; if 3D, just copy
+            if data.ndim == 4:
+                mag_data = data[..., :len(magnitude_indices)]
+            else:
+                mag_data = data
+            mag_img = nib.Nifti1Image(mag_data, img.affine, img.header)
+            nib.save(mag_img, str(bids_magnitude))
+            print(f"Created magnitude fieldmap: {bids_magnitude.name}")
+            # Optionally remove the intermediate file
+            # full_nii.unlink()
+            # Create JSON for magnitude
+            magnitude_json = {
+                "ConversionSoftware": "convert_parrec_to_nifti_bids.py",
+                "ConversionSoftwareVersion": "2.0",
+                "ConversionDate": datetime.now().isoformat(),
+                "SourceFormat": "Philips PAR/REC",
+                "SourceFiles": [
+                    str(par_file),
+                    str(par_file.with_suffix('.REC')),
+                    str(par_file.with_suffix('.XML')),
+                    str(par_file.with_suffix('.V41'))
+                ],
+                "BIDSModality": "fmap",
+                "SubjectID": subject_id,
+                "Units": "Hz",
+                "IntendedFor": []  # Will be populated later
+            }
+            par_metadata = extract_par_metadata(par_file)
+            magnitude_json.update(par_metadata)
+            xml_file = par_file.with_suffix('.XML')
+            xml_metadata = parse_xml_file(xml_file) if xml_file.exists() else {}
+            magnitude_json["XMLMetadata"] = xml_metadata
+            with open(bids_magnitude.with_suffix('.json'), 'w') as f:
+                json.dump(magnitude_json, f, indent=2)
+            return bids_magnitude
+    except subprocess.CalledProcessError as e:
+        print(f"Error extracting magnitude image: {e}\nstderr: {e.stderr}")
+    return None
 
 def main():
     """Main conversion function."""
